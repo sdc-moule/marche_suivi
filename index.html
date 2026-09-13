@@ -97,7 +97,15 @@
   }
   button:active{ transform:scale(0.97); }
   .btn-primary{ background:var(--accent); color:#0e1a13; }
-  .btn-pause{ background:var(--surface-2); color:var(--text); border:1px solid var(--line); }
+  .status-badge{
+    display:flex; align-items:center; gap:7px;
+    font-size:12px; color:var(--text-muted);
+    margin-bottom:14px;
+  }
+  .status-badge .dot{ width:8px; height:8px; border-radius:50%; flex:none; }
+  .status-badge.tracking .dot{ background:var(--accent); animation:pulse 1.4s ease-in-out infinite; }
+  .status-badge.paused .dot{ background:var(--accent-2); }
+  .status-badge.paused{ color:var(--accent-2); }
   .btn-finish{ background:var(--accent-2); color:#241705; }
   .btn-danger{ background:transparent; color:var(--danger); border:1px solid var(--danger); }
 
@@ -122,7 +130,6 @@
     animation:pulse 1.4s ease-in-out infinite;
   }
   @keyframes pulse{ 0%,100%{opacity:1;} 50%{opacity:0.25;} }
-  .auto-tag{ font-size:10px; opacity:0.75; margin-left:4px; font-weight:500; }
 
   .permission-note{
     position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
@@ -280,6 +287,10 @@
       </div>
     </div>
     <div id="trackerPanel">
+      <div class="status-badge tracking" id="statusBadge" style="display:none;">
+        <span class="dot"></span>
+        <span id="statusText">Enregistrement en cours</span>
+      </div>
       <div class="stat-row">
         <div class="stat">
           <div class="label">Durée</div>
@@ -301,11 +312,10 @@
       <div class="controls" id="controlsIdle">
         <button class="btn-primary" onclick="startTracking()">Démarrer la marche</button>
       </div>
-      <div class="controls" id="controlsTracking" style="display:none;">
-        <button class="btn-pause" onclick="togglePause()" id="pauseBtn"><span class="rec-pulse" id="recDot"></span>Pause</button>
+      <div class="controls" id="controlsTracking" style="display:none; justify-content:center;">
         <button class="btn-finish-hold" id="finishBtn">
           <div class="hold-fill" id="holdFill"></div>
-          <span class="hold-label" id="holdLabel">Maintenir 5s<br>pour arrêter</span>
+          <span class="hold-label" id="holdLabel">Maintenir 3s<br>pour arrêter</span>
         </button>
       </div>
     </div>
@@ -374,9 +384,9 @@ let elevGainM = 0;
 let lastGoodAlt = null;
 let lastRawPoint = null;
 let lastSmoothed = null;
-let stillTicks = 0;
-let autoPaused = false;
-let manuallyPaused = false;
+let lastMoveAt = null;
+const NO_MOVE_PAUSE_MS = 10000; // immobilité continue avant mise en pause auto
+const MOVE_THRESHOLD_M = 4;     // déplacement mini pour compter comme "mouvement" (marge sur le bruit GPS à l'arrêt)
 let lastAnnouncedKm = 0;
 let soundEnabled = true;
 let audioCtx = null;
@@ -395,7 +405,7 @@ let replaySpeed = 1;
 let holdTimer = null;
 let holdInterval = null;
 let holdStartAt = 0;
-const HOLD_DURATION_MS = 5000;
+const HOLD_DURATION_MS = 3000;
 
 /* ================= stockage autonome (IndexedDB) =================
    window.storage est fourni par l'environnement Claude (Artifacts).
@@ -655,23 +665,18 @@ function updateElevation(p){
   }
   lastGoodAlt = p.alt;
 }
-function handleAutoPause(pos, p){
-  if (status === 'idle' || manuallyPaused) return;
-  let speed = (typeof pos.coords.speed === 'number' && pos.coords.speed >= 0) ? pos.coords.speed : null;
-  if (speed === null && lastRawPoint){
-    const dt = (p.t - lastRawPoint.t) / 1000;
-    if (dt > 0.5) speed = haversine(lastRawPoint, p) / dt;
+function registerMovement(rawP){
+  if (status === 'idle') return;
+  if (!lastRawPoint){ lastMoveAt = rawP.t; return; }
+  const d = haversine(lastRawPoint, rawP);
+  if (d >= MOVE_THRESHOLD_M){
+    lastMoveAt = rawP.t;
+    if (status === 'paused') exitPause();
   }
-  if (speed === null) return;
-
-  if (status === 'tracking'){
-    if (speed < 0.3){
-      stillTicks++;
-      if (stillTicks >= 3){ autoPaused = true; enterPause(true); }
-    } else stillTicks = 0;
-  } else if (status === 'paused' && autoPaused){
-    if (speed > 0.6){ autoPaused = false; stillTicks = 0; exitPause(); }
-  }
+}
+function checkStillness(){
+  if (status !== 'tracking' || lastMoveAt === null) return;
+  if (Date.now() - lastMoveAt >= NO_MOVE_PAUSE_MS) enterPause();
 }
 
 function onPosition(pos){
@@ -683,7 +688,7 @@ function onPosition(pos){
   };
   if (rawP.acc && rawP.acc > 30) return;
 
-  handleAutoPause(pos, rawP);
+  registerMovement(rawP);
   lastRawPoint = rawP;
 
   if (!currentMarker){
@@ -725,7 +730,7 @@ function startTracking(){
   points = []; distanceM = 0; pausedTotal = 0; pausedAt = null;
   elevGainM = 0; lastGoodAlt = null;
   lastRawPoint = null; lastSmoothed = null;
-  stillTicks = 0; autoPaused = false; manuallyPaused = false;
+  lastMoveAt = Date.now();
   lastAnnouncedKm = 0;
   pathLine.setLatLngs([]);
   if (currentMarker){ map.removeLayer(currentMarker); currentMarker = null; }
@@ -739,34 +744,32 @@ function startTracking(){
 
   document.getElementById('controlsIdle').style.display = 'none';
   document.getElementById('controlsTracking').style.display = 'flex';
-  timerInterval = setInterval(renderStats, 1000);
+  setStatusBadge('tracking');
+  timerInterval = setInterval(() => { renderStats(); checkStillness(); }, 1000);
 }
 
-function enterPause(auto){
+function setStatusBadge(mode){
+  const badge = document.getElementById('statusBadge');
+  const text = document.getElementById('statusText');
+  if (!badge) return;
+  if (mode === 'hidden'){ badge.style.display = 'none'; return; }
+  badge.style.display = 'flex';
+  badge.classList.toggle('tracking', mode === 'tracking');
+  badge.classList.toggle('paused', mode === 'paused');
+  if (text) text.textContent = mode === 'tracking' ? 'Enregistrement en cours' : 'Pause automatique (immobile)';
+}
+
+function enterPause(){
   status = 'paused';
   pausedAt = Date.now();
-  document.getElementById('pauseBtn').innerHTML = auto
-    ? 'Reprendre <span class="auto-tag">(pause auto)</span>'
-    : 'Reprendre';
-  const dot = document.getElementById('recDot');
-  if (dot) dot.style.display = 'none';
+  setStatusBadge('paused');
 }
 function exitPause(){
   pausedTotal += Date.now() - pausedAt;
   pausedAt = null;
   status = 'tracking';
-  document.getElementById('pauseBtn').innerHTML = '<span class="rec-pulse" id="recDot"></span>Pause';
-}
-function togglePause(){
-  if (status === 'tracking'){
-    manuallyPaused = true;
-    enterPause(false);
-  } else if (status === 'paused'){
-    manuallyPaused = false;
-    autoPaused = false;
-    stillTicks = 0;
-    exitPause();
-  }
+  lastMoveAt = Date.now();
+  setStatusBadge('tracking');
 }
 function pauseTrackingSilent(){
   if (status === 'tracking'){ status = 'paused'; pausedAt = Date.now(); }
@@ -802,7 +805,7 @@ function updateHoldUI(frac){
   if (fill) fill.style.width = (frac * 100) + '%';
   if (label){
     if (frac <= 0){
-      label.innerHTML = 'Maintenir 5s<br>pour arrêter';
+      label.innerHTML = 'Maintenir 3s<br>pour arrêter';
     } else {
       const remaining = Math.ceil((HOLD_DURATION_MS - frac * HOLD_DURATION_MS) / 1000);
       label.textContent = remaining + ' s…';
@@ -862,14 +865,13 @@ function resetTrackerUI(){
   status = 'idle';
   points = []; distanceM = 0; pausedTotal = 0;
   elevGainM = 0; lastGoodAlt = null;
-  lastRawPoint = null; lastSmoothed = null;
-  stillTicks = 0; autoPaused = false; manuallyPaused = false;
+  lastRawPoint = null; lastSmoothed = null; lastMoveAt = null;
   lastAnnouncedKm = 0;
   pathLine.setLatLngs([]);
   if (currentMarker){ map.removeLayer(currentMarker); currentMarker = null; }
   document.getElementById('controlsIdle').style.display = 'flex';
   document.getElementById('controlsTracking').style.display = 'none';
-  document.getElementById('pauseBtn').innerHTML = '<span class="rec-pulse" id="recDot"></span>Pause';
+  setStatusBadge('hidden');
   renderStats();
 }
 
